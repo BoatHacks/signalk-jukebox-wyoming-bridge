@@ -10,7 +10,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { MockWyomingServer } from "signalk-wyoming/mock";
 import { AudioStart, AudioChunk, parseAudioStart, parseAudioChunk } from "signalk-wyoming/protocol";
-import { handshake, bytesPerFrame, FALLBACK_FORMAT } from "../bridge.mjs";
+import { handshake, bytesPerFrame, downmixToMono, FALLBACK_FORMAT } from "../bridge.mjs";
 
 let server: MockWyomingServer | undefined;
 
@@ -23,6 +23,22 @@ describe("bytesPerFrame", () => {
   it("multiplies width by channel count", () => {
     expect(bytesPerFrame({ rate: 16000, width: 2, channels: 1 })).toBe(2);
     expect(bytesPerFrame({ rate: 48000, width: 2, channels: 2 })).toBe(4);
+  });
+});
+
+describe("downmixToMono", () => {
+  it("averages L/R into one 16-bit sample per frame", () => {
+    // frame 1: L=100, R=200 -> 150; frame 2: L=-100, R=-300 -> -200
+    const stereo = Buffer.alloc(8);
+    stereo.writeInt16LE(100, 0);
+    stereo.writeInt16LE(200, 2);
+    stereo.writeInt16LE(-100, 4);
+    stereo.writeInt16LE(-300, 6);
+
+    const mono = downmixToMono(stereo);
+    expect(mono.length).toBe(4);
+    expect(mono.readInt16LE(0)).toBe(150);
+    expect(mono.readInt16LE(2)).toBe(-200);
   });
 });
 

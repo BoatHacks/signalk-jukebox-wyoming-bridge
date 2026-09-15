@@ -18,16 +18,32 @@
 // Wyoming side, using signalk-wyoming's own protocol module (`/protocol`
 // subpath export) rather than reimplementing wire framing.
 //
-// Verified so far: the Dockerfile builds and installs cleanly; the Wyoming
-// handshake (describe/info/pause-satellite/audio-start/audio-chunk framing)
-// is covered by test/handshake.test.ts against signalk-wyoming's own mock
-// satellite server. NOT yet verified end-to-end against a real panel and a
-// real Snapserver together -- do that before calling this more than a
-// strong first draft.
+// Verified: Dockerfile builds cleanly; the Wyoming handshake and audio
+// framing are covered by test/handshake.test.ts against signalk-wyoming's
+// mock satellite server; live-tested end to end against a real
+// signalk-jukebox Snapserver and a real espos-p4-cockpit panel (audible
+// SomaFM playback). One real bug found by that live test and fixed here:
+// snapclient's `file` player cannot downmix channels itself ("sampleformat
+// channels must be * (= same as the source)"), so this script downmixes
+// stereo to mono when the satellite wants mono.
+//
+// Explicit stop/start, not "just let the stream idle": confirmed live that
+// leaving audio-start open indefinitely through a Mopidy pause is not
+// merely wasteful -- snapclient's file player did a Stop/reopen cycle
+// after a sustained no-chunks gap and then the whole process died,
+// dropping the bridge's Wyoming connection with it. Two independent
+// triggers now send an explicit audio-stop instead of waiting for that:
+// an idle timeout (no FIFO data -- covers Mopidy paused/stopped, where
+// the source stream produces nothing at all, not silence) and the zone's
+// own Snapcast mute state (polled via Client.GetStatus, same "poll, don't
+// subscribe" pattern signalk-jukebox's own snapserver-client.ts already
+// uses -- covers a real still-flowing-but-silenced stream, which an idle
+// timeout alone would never catch since chunks keep arriving muted).
 
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
+import net from "node:net";
 import {
   WyomingConnection,
   Describe,
@@ -108,6 +124,18 @@ export function downmixToMono(pcm) {
   return out;
 }
 
+/** Mean absolute sample amplitude (0..32767) -- cheap loudness proxy used
+ *  to tell real audio apart from snapclient's comfort-silence padding
+ *  (confirmed live: exact all-zero frames, written continuously even
+ *  through a Mopidy pause -- see main()'s silence-detection comment). */
+export function meanAbsAmplitude(pcm) {
+  const samples = pcm.length / 2;
+  if (samples === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < pcm.length; i += 2) sum += Math.abs(pcm.readInt16LE(i));
+  return sum / samples;
+}
+
 /** Spawn snapclient joining a Snapserver, decoding into the FIFO at the
  *  satellite's own advertised rate/bit-depth -- resampling happens here
  *  (snapclient's job). Channel count is `*` (keep the source's, always
@@ -131,6 +159,52 @@ function spawnSnapclient({ snapcastHost, snapcastPort, fifoPath, bridgeId, forma
   );
 }
 
+/**
+ * One request/response over Snapserver's control API -- a fresh
+ * connection per call, not a persistent one: at a 2 s poll interval the
+ * connect overhead is irrelevant, and this way a Snapserver restart never
+ * needs its own reconnect logic (confirmed real: this is a raw
+ * newline-terminated JSON-RPC socket, not HTTP, same as signalk-jukebox's
+ * own snapserver-client.ts documents -- a bare POST to this port fails).
+ */
+function controlCall(host, port, method, params, { timeoutMs = 3000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host, port });
+    let buf = "";
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`control call ${method} timed out`));
+    }, timeoutMs);
+    socket.on("connect", () => {
+      socket.write(JSON.stringify({ id: 1, jsonrpc: "2.0", method, params }) + "\n");
+    });
+    socket.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl === -1) return;
+      clearTimeout(timer);
+      socket.destroy();
+      try {
+        const msg = JSON.parse(buf.slice(0, nl));
+        if (msg.error) reject(new Error(msg.error.message ?? "RPC error"));
+        else resolve(msg.result);
+      } catch (err) {
+        reject(err);
+      }
+    });
+    socket.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+/** Current muted state of one Snapcast client (our BRIDGE_ID). */
+async function getClientMuted(host, port, clientId) {
+  const result = await controlCall(host, port, "Client.GetStatus", { id: clientId });
+  return Boolean(result?.client?.config?.volume?.muted);
+}
+
 function requiredEnv(name) {
   const v = process.env[name];
   if (!v) {
@@ -150,6 +224,7 @@ async function main() {
   // Must be unique per bridge instance; whatever manages these as
   // containers is responsible for assigning one per satellite target.
   const bridgeId = requiredEnv("BRIDGE_ID");
+  const controlPort = Number(process.env.SNAPCAST_CONTROL_PORT || "1705");
   const fifoPath = "/tmp/bridge.pcm";
 
   const { conn, format } = await handshake(wyomingHost, wyomingPort);
@@ -157,6 +232,50 @@ async function main() {
     `paired with ${wyomingHost}:${wyomingPort}, streaming at ` +
       `${format.rate} Hz / ${format.width * 8}-bit / ${format.channels}ch`,
   );
+
+  // Whether we're between audio-start and audio-stop right now -- explicit
+  // state, not inferred from "have we seen a chunk recently", so start/stop
+  // each fire exactly once per transition regardless of which of the two
+  // triggers below caused it.
+  let streaming = false;
+  function stopStream(reason) {
+    if (!streaming) return;
+    streaming = false;
+    conn.write(AudioStop());
+    console.log(`audio-stop (${reason})`);
+  }
+  function startStream() {
+    if (streaming) return;
+    streaming = true;
+    conn.write(AudioStart(format));
+    console.log("audio-start");
+  }
+
+  // Zone mute, polled rather than subscribed to -- Client.GetStatus is the
+  // same call signalk-jukebox's own snapserver-client.ts uses, and this
+  // bridge doesn't exist yet in Snapserver's client list until snapclient
+  // (started below) has actually connected once, so the first few polls
+  // are expected to fail -- that's fine, they just leave `muted` at its
+  // last known value (false, initially).
+  let muted = false;
+  const muteTimer = setInterval(async () => {
+    let nowMuted;
+    try {
+      nowMuted = await getClientMuted(snapcastHost, controlPort, bridgeId);
+    } catch {
+      return; // client not registered yet, or a transient control-API hiccup
+    }
+    if (nowMuted === muted) return;
+    muted = nowMuted;
+    console.log(`zone ${muted ? "muted" : "unmuted"}`);
+    // Muting doesn't stop chunks arriving (Snapcast's client-side mixer
+    // silences the decoded PCM upstream of the player, it doesn't stop the
+    // stream) -- an idle timeout alone would never see this, so react here
+    // immediately instead of waiting for one. Unmuting needs no action:
+    // the FIFO handler below already gates on `muted` and will send a
+    // fresh audio-start the moment real chunks are allowed through again.
+    if (muted) stopStream("zone muted");
+  }, 2000);
 
   await rm(fifoPath, { force: true });
   await mkdir("/tmp", { recursive: true });
@@ -187,8 +306,6 @@ async function main() {
     process.exit(code === 0 ? 1 : code ?? 1);
   });
 
-  conn.write(AudioStart(format));
-
   // Keepalive: espos_voice answers `ping` with `pong` but never pings US
   // (confirmed by reading wyoming_satellite.cpp) -- without this, a dead
   // TCP peer (panel reboot, Wi-Fi drop) is invisible until the OS's own
@@ -205,6 +322,8 @@ async function main() {
   conn.on("close", () => {
     console.error("satellite connection closed; exiting to reconnect cleanly");
     clearInterval(pingTimer);
+    clearInterval(muteTimer);
+    clearTimeout(silenceTimer);
     snapclient.kill();
     process.exit(1);
   });
@@ -215,6 +334,21 @@ async function main() {
         `${SOURCE_CHANNELS} (passthrough) are supported`,
     );
   }
+
+  // Silence detection, NOT "absence of data" -- confirmed live that
+  // snapclient's file player keeps writing fixed-size comfort-silence
+  // chunks continuously even while it logs "No chunks available" (a
+  // Mopidy pause never actually stops the FIFO writes; the frames are
+  // just all-zero). An earlier draft here waited for data to stop
+  // arriving at all and never fired. meanAbsAmplitude below
+  // SILENCE_THRESHOLD for SILENCE_HOLD_MS straight is what actually
+  // means "nothing worth relaying" -- comfort-silence is exact digital
+  // zero, so this threshold has wide headroom under even quiet real
+  // music.
+  const SILENCE_THRESHOLD = 50; // mean |sample|, out of a possible 32767
+  const SILENCE_HOLD_MS = 2000;
+  let silenceTimer = null;
+
   const fifo = createReadStream(fifoPath);
   // Truncate to whole SOURCE frames, not the satellite's target frame size
   // -- the FIFO always carries SOURCE_CHANNELS PCM regardless of what the
@@ -222,15 +356,43 @@ async function main() {
   // truncation, never before.
   const sourceFrameSize = format.width * SOURCE_CHANNELS;
   fifo.on("data", (chunk) => {
-    // Snapclient's `file` player writes whatever it decodes per callback;
-    // truncate so a chunk boundary never splits a frame (parseAudioChunk
-    // on the far end trusts payload_len).
+    // Zone muted: Snapcast's client-side mixer already silenced this PCM
+    // upstream of us, but there's no point relaying silence to the
+    // satellite -- drop it here instead. (The mute poller above already
+    // sent audio-stop on the transition; this just keeps us stopped for
+    // as long as muted stays true.)
+    if (muted) return;
     const usable = chunk.length - (chunk.length % sourceFrameSize);
     if (usable === 0) return;
     const pcm = chunk.subarray(0, usable);
-    conn.write(
-      AudioChunk(format, format.channels === 1 ? downmixToMono(pcm) : pcm),
-    );
+
+    if (meanAbsAmplitude(pcm) < SILENCE_THRESHOLD) {
+      // Keep relaying through the hold window -- only actually stop once
+      // it's been silent this long straight, so a real quiet passage or a
+      // one-chunk blip doesn't chop the stream. Deliberately does NOT
+      // startStream() here: comfort-silence arriving while already
+      // stopped must stay stopped -- calling it unconditionally caused an
+      // immediate audio-start right back after every silence timeout
+      // (confirmed live: start/stop flapping once a second).
+      if (streaming && silenceTimer === null) {
+        silenceTimer = setTimeout(() => {
+          silenceTimer = null;
+          stopStream("silence");
+        }, SILENCE_HOLD_MS);
+      }
+    } else {
+      if (silenceTimer !== null) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
+      }
+      startStream(); // no-op if already streaming
+    }
+
+    if (streaming) {
+      conn.write(
+        AudioChunk(format, format.channels === 1 ? downmixToMono(pcm) : pcm),
+      );
+    }
   });
   fifo.on("error", (err) => {
     console.error("FIFO read error:", err.message);
@@ -239,8 +401,10 @@ async function main() {
 
   process.on("SIGTERM", async () => {
     clearInterval(pingTimer);
+    clearInterval(muteTimer);
+    clearTimeout(silenceTimer);
     try {
-      conn.write(AudioStop());
+      stopStream("shutdown");
     } catch {
       // connection may already be gone; nothing left to clean up
     }

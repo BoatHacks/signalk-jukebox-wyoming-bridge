@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-15
+
+### Fixed
+
+- The bridge now sends an explicit `audio-stop` when Mopidy pauses/stops
+  or the zone is muted, instead of leaving `audio-start` open
+  indefinitely. Confirmed live this was a real bug, not just wasteful:
+  after a sustained gap with nothing relayed, `snapclient`'s `file`
+  player did a Stop/reopen cycle and the whole process then died,
+  dropping the bridge's Wyoming connection with it.
+- Two triggers, since neither alone covers both cases (confirmed live):
+  an idle/no-data timeout does NOT fire on pause -- `snapclient`'s file
+  player keeps writing fixed-size comfort-silence frames continuously
+  even with nothing playing, so absence-of-data never happens. Detecting
+  near-silence in the decoded PCM itself (2 s hold) does. Muting doesn't
+  stop chunks arriving either (Snapcast's client-side mixer silences PCM
+  upstream of the player), so a separate 2 s poll of the zone's mute
+  state via `Client.GetStatus` reacts to that immediately rather than
+  waiting out the silence hold on top.
+- Fixed a start/stop flap introduced while chasing the above: an early
+  version called `startStream()` unconditionally on every chunk,
+  including comfort-silence, so the stream immediately restarted right
+  after every silence-triggered stop.
+
 ## [0.1.0] - 2026-09-15
 
 ### Added

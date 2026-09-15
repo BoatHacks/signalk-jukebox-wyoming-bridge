@@ -34,11 +34,12 @@ Snapserver  --(Snapcast protocol)-->  snapclient (this image)
 
 | Env var         | Required | Default | Meaning |
 |------------------|----------|---------|---------|
-| `SNAPCAST_HOST`  | yes      |         | Host of the jukebox's Snapserver |
-| `SNAPCAST_PORT`  | no       | `1704`  | Snapserver's stream port |
-| `WYOMING_HOST`   | yes      |         | Target satellite's IP/host |
-| `WYOMING_PORT`   | no       | `10700` | Target satellite's Wyoming port |
-| `BRIDGE_ID`      | yes      |         | Fixed Snapcast client id for this bridge instance -- must be unique per bridge if running more than one (one per satellite target) |
+| `SNAPCAST_HOST`         | yes      |         | Host of the jukebox's Snapserver |
+| `SNAPCAST_PORT`         | no       | `1704`  | Snapserver's stream port |
+| `SNAPCAST_CONTROL_PORT` | no       | `1705`  | Snapserver's JSON-RPC control port (used to poll this zone's mute state) |
+| `WYOMING_HOST`          | yes      |         | Target satellite's IP/host |
+| `WYOMING_PORT`          | no       | `10700` | Target satellite's Wyoming port |
+| `BRIDGE_ID`             | yes      |         | Fixed Snapcast client id for this bridge instance -- must be unique per bridge if running more than one (one per satellite target) |
 
 Playback format (sample rate, bit depth) is discovered automatically from
 the satellite's own `describe`/`info` handshake, not hardcoded. Channel
@@ -47,6 +48,30 @@ count is handled by downmixing: Snapcast streams are always stereo;
 (confirmed live -- `sampleformat channels must be * (= same as the
 source)`), so `bridge.mjs` downmixes stereo to mono itself when the
 satellite advertises `channels: 1`.
+
+### Stop/start behaviour
+
+The bridge sends an explicit `audio-stop` -- not just a lull in
+`audio-chunk`s -- whenever there's nothing worth relaying, and a fresh
+`audio-start` when real audio resumes:
+
+- **Mopidy paused/stopped**: detected as sustained near-silence in the
+  decoded PCM (snapclient's `file` player keeps writing fixed-size
+  comfort-silence frames even with nothing playing -- confirmed live
+  that waiting for the FIFO to go quiet outright never fires). A 2 s
+  hold avoids chopping the stream on a single quiet passage or a
+  one-chunk blip.
+- **Zone muted** (via signalk-jukebox's own volume/mute UI, or any
+  Snapcast client): polled every 2 s via `Client.GetStatus` on
+  Snapserver's control port and reacted to immediately, since a mute
+  doesn't stop chunks arriving -- Snapcast's client-side mixer silences
+  the decoded PCM upstream of the player, so the silence-detection path
+  above would eventually also catch it, but only after its 2 s hold
+  window on top of whatever the mute poll's own interval already cost.
+
+Both were confirmed live against a real panel and a real Snapserver,
+including that an earlier draft without this got the pause case wrong in
+two different ways before landing here (see CHANGELOG).
 
 ## Status
 
