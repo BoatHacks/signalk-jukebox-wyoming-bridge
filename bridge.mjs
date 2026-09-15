@@ -183,7 +183,18 @@ function controlCall(host, port, method, params, { timeoutMs = 3000 } = {}) {
       const nl = buf.indexOf("\n");
       if (nl === -1) return;
       clearTimeout(timer);
-      socket.destroy();
+      // end(), not destroy(): a full response has actually been read, so
+      // this is a clean close, not an abort. Doesn't actually silence
+      // Snapserver's own "(ControlSessionTCP) Error while reading from
+      // control socket: End of file" log line -- confirmed live that it
+      // logs that on ANY short-lived control connection closing, this
+      // way or via destroy(); a real fix would mean keeping one
+      // persistent control connection open across polls instead of
+      // reconnecting every 2s. Left as end() anyway since it's still the
+      // more correct close for a request that actually completed;
+      // destroy() stays right on the timeout path above, where there
+      // genuinely is nothing more to wait for.
+      socket.end();
       try {
         const msg = JSON.parse(buf.slice(0, nl));
         if (msg.error) reject(new Error(msg.error.message ?? "RPC error"));
@@ -324,6 +335,7 @@ async function main() {
     clearInterval(pingTimer);
     clearInterval(muteTimer);
     clearTimeout(silenceTimer);
+    clearTimeout(noDataTimer);
     snapclient.kill();
     process.exit(1);
   });
@@ -349,6 +361,20 @@ async function main() {
   const SILENCE_HOLD_MS = 2000;
   let silenceTimer = null;
 
+  // Second, independent watchdog for genuinely NO data -- confirmed live
+  // this is a real, different case from silence-in-arriving-data: a zone
+  // switched to the raw `Alerts` stream (a tcp mode=server source with no
+  // announcement client currently connected to it) delivers literally
+  // nothing, not even comfort-silence padding, so the meanAbsAmplitude
+  // check above never runs at all (no 'data' event fires). Left alone,
+  // that ran for 110s before snapclient's own internal watchdog did a
+  // Stop/reopen cycle and the whole process died -- the exact same
+  // failure mode the silence detector was built to avoid, just via the
+  // one path it doesn't cover. Reset on every 'data' event regardless of
+  // content, unlike silenceTimer which only resets on non-silent audio.
+  const NO_DATA_TIMEOUT_MS = 3000;
+  let noDataTimer = setTimeout(() => stopStream("no data"), NO_DATA_TIMEOUT_MS);
+
   const fifo = createReadStream(fifoPath);
   // Truncate to whole SOURCE frames, not the satellite's target frame size
   // -- the FIFO always carries SOURCE_CHANNELS PCM regardless of what the
@@ -356,6 +382,9 @@ async function main() {
   // truncation, never before.
   const sourceFrameSize = format.width * SOURCE_CHANNELS;
   fifo.on("data", (chunk) => {
+    clearTimeout(noDataTimer);
+    noDataTimer = setTimeout(() => stopStream("no data"), NO_DATA_TIMEOUT_MS);
+
     // Zone muted: Snapcast's client-side mixer already silenced this PCM
     // upstream of us, but there's no point relaying silence to the
     // satellite -- drop it here instead. (The mute poller above already
@@ -403,6 +432,7 @@ async function main() {
     clearInterval(pingTimer);
     clearInterval(muteTimer);
     clearTimeout(silenceTimer);
+    clearTimeout(noDataTimer);
     try {
       stopStream("shutdown");
     } catch {

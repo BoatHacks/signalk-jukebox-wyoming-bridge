@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-15
+
+### Fixed
+
+- The bridge no longer crashes when a zone is switched to a stream with
+  no active source (e.g. `Alerts` with nothing currently pushing
+  announcement audio into it). Confirmed live: that stream delivers
+  literally nothing -- not even comfort-silence padding -- so the
+  silence-in-arriving-data detector added in 0.1.1 never fired (no
+  `data` event to inspect), and after 110s of total silence
+  `snapclient`'s own internal watchdog did a Stop/reopen cycle and the
+  process died anyway. A second, independent watchdog now resets on
+  every FIFO `data` event regardless of content and sends `audio-stop`
+  after 3s of literally nothing arriving, closing the gap the
+  content-based detector doesn't cover.
+- Minor: `controlCall`'s socket close on a completed request now uses
+  `end()` instead of `destroy()` (more correct for a request that
+  actually finished, though confirmed live it does not silence
+  Snapserver's own "(ControlSessionTCP) ... End of file" log line on a
+  short-lived control connection either way -- a real fix needs a
+  persistent control connection reused across polls, left for later).
+
 ## [0.1.1] - 2026-09-15
 
 ### Fixed
