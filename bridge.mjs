@@ -160,59 +160,94 @@ function spawnSnapclient({ snapcastHost, snapcastPort, fifoPath, bridgeId, forma
 }
 
 /**
- * One request/response over Snapserver's control API -- a fresh
- * connection per call, not a persistent one: at a 2 s poll interval the
- * connect overhead is irrelevant, and this way a Snapserver restart never
- * needs its own reconnect logic (confirmed real: this is a raw
- * newline-terminated JSON-RPC socket, not HTTP, same as signalk-jukebox's
- * own snapserver-client.ts documents -- a bare POST to this port fails).
+ * One persistent connection to Snapserver's control API, reused across
+ * calls instead of reconnecting per poll. Confirmed live that a fresh
+ * connection per call -- the original design here, chosen specifically
+ * to avoid needing reconnect logic -- has a real cost: Snapserver logs
+ * "(ControlSessionTCP) Error while reading from control socket: End of
+ * file" on every single short-lived connection closing, clean or not,
+ * so a 2 s poll interval spammed that continuously. Reconnect logic is
+ * unavoidable to actually fix it, so this class owns it: lazy connect on
+ * first call(), and any close/error just drops the socket so the next
+ * call() reconnects -- no separate background retry loop needed at a
+ * 2 s poll cadence.
  */
-function controlCall(host, port, method, params, { timeoutMs = 3000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect({ host, port });
-    let buf = "";
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error(`control call ${method} timed out`));
-    }, timeoutMs);
-    socket.on("connect", () => {
-      socket.write(JSON.stringify({ id: 1, jsonrpc: "2.0", method, params }) + "\n");
-    });
-    socket.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-      const nl = buf.indexOf("\n");
-      if (nl === -1) return;
-      clearTimeout(timer);
-      // end(), not destroy(): a full response has actually been read, so
-      // this is a clean close, not an abort. Doesn't actually silence
-      // Snapserver's own "(ControlSessionTCP) Error while reading from
-      // control socket: End of file" log line -- confirmed live that it
-      // logs that on ANY short-lived control connection closing, this
-      // way or via destroy(); a real fix would mean keeping one
-      // persistent control connection open across polls instead of
-      // reconnecting every 2s. Left as end() anyway since it's still the
-      // more correct close for a request that actually completed;
-      // destroy() stays right on the timeout path above, where there
-      // genuinely is nothing more to wait for.
-      socket.end();
+class ControlConnection {
+  #host;
+  #port;
+  #socket = null;
+  #buf = "";
+  #nextId = 1;
+  #pending = new Map(); // id -> {resolve, reject, timer}
+
+  constructor(host, port) {
+    this.#host = host;
+    this.#port = port;
+  }
+
+  #ensureConnected() {
+    if (this.#socket) return;
+    const socket = net.connect({ host: this.#host, port: this.#port });
+    this.#socket = socket;
+    socket.on("data", (chunk) => this.#onData(chunk));
+    socket.on("close", () => this.#onDisconnect(new Error("control connection closed")));
+    socket.on("error", (err) => this.#onDisconnect(err));
+  }
+
+  #onData(chunk) {
+    this.#buf += chunk.toString("utf8");
+    for (;;) {
+      const nl = this.#buf.indexOf("\n");
+      if (nl === -1) break;
+      const line = this.#buf.slice(0, nl);
+      this.#buf = this.#buf.slice(nl + 1);
+      let msg;
       try {
-        const msg = JSON.parse(buf.slice(0, nl));
-        if (msg.error) reject(new Error(msg.error.message ?? "RPC error"));
-        else resolve(msg.result);
-      } catch (err) {
-        reject(err);
+        msg = JSON.parse(line);
+      } catch {
+        continue; // malformed line -- drop it, the request that wanted it will time out
       }
+      const waiter = this.#pending.get(msg.id);
+      if (!waiter) continue; // unsolicited notification (e.g. Client.OnUpdate) -- not consumed here
+      this.#pending.delete(msg.id);
+      clearTimeout(waiter.timer);
+      if (msg.error) waiter.reject(new Error(msg.error.message ?? "RPC error"));
+      else waiter.resolve(msg.result);
+    }
+  }
+
+  #onDisconnect(err) {
+    this.#socket = null;
+    this.#buf = "";
+    for (const waiter of this.#pending.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(err);
+    }
+    this.#pending.clear();
+  }
+
+  call(method, params, { timeoutMs = 3000 } = {}) {
+    this.#ensureConnected();
+    const id = this.#nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#pending.delete(id);
+        reject(new Error(`control call ${method} timed out`));
+      }, timeoutMs);
+      this.#pending.set(id, { resolve, reject, timer });
+      this.#socket.write(JSON.stringify({ id, jsonrpc: "2.0", method, params }) + "\n");
     });
-    socket.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
+  }
+
+  close() {
+    this.#onDisconnect(new Error("control connection closed"));
+    this.#socket?.destroy();
+  }
 }
 
 /** Current muted state of one Snapcast client (our BRIDGE_ID). */
-async function getClientMuted(host, port, clientId) {
-  const result = await controlCall(host, port, "Client.GetStatus", { id: clientId });
+async function getClientMuted(control, clientId) {
+  const result = await control.call("Client.GetStatus", { id: clientId });
   return Boolean(result?.client?.config?.volume?.muted);
 }
 
@@ -267,12 +302,16 @@ async function main() {
   // bridge doesn't exist yet in Snapserver's client list until snapclient
   // (started below) has actually connected once, so the first few polls
   // are expected to fail -- that's fine, they just leave `muted` at its
-  // last known value (false, initially).
+  // last known value (false, initially). One persistent ControlConnection
+  // for the whole process lifetime, not a fresh socket per poll -- see
+  // that class's own doc comment for why (Snapserver logs a spurious
+  // error on every short-lived control connection closing).
+  const control = new ControlConnection(snapcastHost, controlPort);
   let muted = false;
   const muteTimer = setInterval(async () => {
     let nowMuted;
     try {
-      nowMuted = await getClientMuted(snapcastHost, controlPort, bridgeId);
+      nowMuted = await getClientMuted(control, bridgeId);
     } catch {
       return; // client not registered yet, or a transient control-API hiccup
     }
@@ -336,6 +375,7 @@ async function main() {
     clearInterval(muteTimer);
     clearTimeout(silenceTimer);
     clearTimeout(noDataTimer);
+    control.close();
     snapclient.kill();
     process.exit(1);
   });
@@ -433,6 +473,7 @@ async function main() {
     clearInterval(muteTimer);
     clearTimeout(silenceTimer);
     clearTimeout(noDataTimer);
+    control.close();
     try {
       stopStream("shutdown");
     } catch {

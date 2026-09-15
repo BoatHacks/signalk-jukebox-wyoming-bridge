@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-15
+
+### Fixed
+
+- The mute poller now holds one persistent connection to Snapserver's
+  control API for the process lifetime instead of reconnecting every
+  2s. Fixes the `(ControlSessionTCP) Error while reading from control
+  socket: End of file` log line Snapserver logged on every single
+  short-lived control connection closing (the 0.1.2 `end()` vs
+  `destroy()` attempt didn't actually help -- confirmed live Snapserver
+  logs that either way). Reconnects lazily on the next call after any
+  disconnect, so a Snapserver restart still needs no separate retry
+  loop.
+
 ## [0.1.2] - 2026-09-15
 
 ### Fixed
