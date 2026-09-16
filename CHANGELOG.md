@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-16
+
+### Fixed
+
+- `package.json` had no `"files"` field, so the npm tarball shipped
+  `Dockerfile`, `.github/workflows/`, `test/`, and `vitest.config.ts`
+  alongside the actual runtime file `bridge.mjs`. Added
+  `"files": ["bridge.mjs", "entrypoint.sh"]` so only what the container
+  actually runs ships (5 files, 13KB, down from 11 files, 18KB).
+
 ## [0.1.5] - 2026-09-16
 
 ### Fixed
