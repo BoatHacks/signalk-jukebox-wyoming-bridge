@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-16
+
+### Fixed
+
+- No code change. The first manual `npm publish` (required to bootstrap
+  npm's trusted-publisher chicken-and-egg) was accidentally run against
+  a stale `0.1.3` checkout, publishing `0.1.3` to npm while ghcr.io's
+  image was already at `0.1.4`. This release resyncs npm with ghcr.io
+  and is the first version published via the now-registered OIDC
+  trusted publisher, with no manual `npm publish` step.
+
 ## [0.1.4] - 2026-09-15
 
 ### Added
