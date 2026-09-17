@@ -39,6 +39,18 @@
 // subscribe" pattern signalk-jukebox's own snapserver-client.ts already
 // uses -- covers a real still-flowing-but-silenced stream, which an idle
 // timeout alone would never catch since chunks keep arriving muted).
+//
+// snapclient is respawned in place on exit, not treated as always-fatal:
+// confirmed live that switching this zone onto a Snapcast stream with a
+// different native sample rate than whatever snapclient is currently
+// decoding (e.g. signalk-jukebox's own AirPlay input, which Snapcast
+// forces to 44100:16:2 while every other stream there is 48000:16:2)
+// reliably crashes snapclient when it tries to reconfigure its resampler
+// -- an expected, recoverable consequence of a normal zone reassignment,
+// not a real failure. main()'s startSnapclient()/nextRapidExitState()
+// bound this: enough rapid, repeated crashes still falls back to exiting
+// the whole process (the original behavior) rather than respawning
+// forever against a genuinely broken connection.
 
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
@@ -134,6 +146,25 @@ export function meanAbsAmplitude(pcm) {
   let sum = 0;
   for (let i = 0; i < pcm.length; i += 2) sum += Math.abs(pcm.readInt16LE(i));
   return sum / samples;
+}
+
+// A crash within this long of starting counts as "didn't really run" --
+// e.g. a format-change crash happens near-instantly. Five of those in a
+// row (not five ever) means something is genuinely broken (bad Snapserver
+// host, corrupt binary, etc.), not a one-off reconfiguration hiccup --
+// callers should fall back to a fatal exit rather than respawn forever.
+export const RAPID_EXIT_THRESHOLD_MS = 3000;
+export const MAX_CONSECUTIVE_RAPID_EXITS = 5;
+
+/** Given how long the last snapclient run lasted and the current
+ *  consecutive-rapid-exit count, returns the updated count and whether
+ *  the caller should give up respawning. A run that lasted at least
+ *  RAPID_EXIT_THRESHOLD_MS resets the count to 0 (treated as an
+ *  unrelated, fresh failure), not just decremented -- one long-lived run
+ *  between crashes means whatever caused the earlier ones is resolved. */
+export function nextRapidExitState(ranMs, previousCount) {
+  const count = ranMs < RAPID_EXIT_THRESHOLD_MS ? previousCount + 1 : 0;
+  return { count, giveUp: count >= MAX_CONSECUTIVE_RAPID_EXITS };
 }
 
 /** Spawn snapclient joining a Snapserver, decoding into the FIFO at the
@@ -338,23 +369,55 @@ async function main() {
     );
   });
 
-  const snapclient = spawnSnapclient({
-    snapcastHost,
-    snapcastPort,
-    fifoPath,
-    bridgeId,
-    format,
-  });
-  // Supervision, same reasoning as signalk-jukebox's own image/entrypoint.sh
-  // wait -n fix: if snapclient dies, this whole process must exit so the
-  // container exits and podman's restart:unless-stopped policy recreates a
-  // clean instance -- a bridge silently holding a dead Wyoming connection
-  // open while its Snapcast half is gone would be the same "looks Up, is
-  // actually useless" failure mode that bit the main jukebox container.
-  snapclient.on("exit", (code) => {
-    console.error(`snapclient exited (${code}); exiting to restart cleanly`);
-    process.exit(code === 0 ? 1 : code ?? 1);
-  });
+  // Respawned in place on a recoverable exit, not just spawned once --
+  // `let`, not `const`, so SIGTERM/conn-close's snapclient.kill() calls
+  // below always reach the current instance. Confirmed live: switching a
+  // zone onto a Snapcast stream with a different native sample rate than
+  // whatever snapclient is currently decoding (e.g. this project's own
+  // AirPlay input, forced to 44100:16:2 while every other stream here is
+  // 48000:16:2) reliably crashes snapclient outright when it tries to
+  // reconfigure its resampler for the new format -- a normal, expected
+  // consequence of a zone reassignment, not a sign anything is actually
+  // broken. Treating that the same as a genuine failure (the previous
+  // behavior: exit this whole process and rely on the container's
+  // restart:unless-stopped policy) meant a single zone-source switch
+  // could silently and permanently kill the bridge, made worse by a
+  // separate, confirmed bug in signalk-container-helper where that
+  // restart policy isn't actually applied to the container at all.
+  let snapclient;
+  let shuttingDown = false;
+  let snapclientStartedAt = 0;
+  let rapidExitCount = 0;
+
+  function startSnapclient() {
+    snapclientStartedAt = Date.now();
+    snapclient = spawnSnapclient({
+      snapcastHost,
+      snapcastPort,
+      fifoPath,
+      bridgeId,
+      format,
+    });
+    snapclient.on("exit", (code) => {
+      if (shuttingDown) return; // already tearing down -- nothing to recover
+      const ranMs = Date.now() - snapclientStartedAt;
+      const { count, giveUp } = nextRapidExitState(ranMs, rapidExitCount);
+      rapidExitCount = count;
+      if (giveUp) {
+        console.error(
+          `snapclient exited (${code}) ${count} times in a row within ` +
+            `${RAPID_EXIT_THRESHOLD_MS}ms of starting; giving up and exiting to restart cleanly`,
+        );
+        process.exit(code === 0 ? 1 : (code ?? 1));
+        return;
+      }
+      console.error(
+        `snapclient exited (${code}) after ${ranMs}ms; respawning in place`,
+      );
+      startSnapclient();
+    });
+  }
+  startSnapclient();
 
   // Keepalive: espos_voice answers `ping` with `pong` but never pings US
   // (confirmed by reading wyoming_satellite.cpp) -- without this, a dead
@@ -371,6 +434,7 @@ async function main() {
 
   conn.on("close", () => {
     console.error("satellite connection closed; exiting to reconnect cleanly");
+    shuttingDown = true; // don't respawn snapclient for the kill() below
     clearInterval(pingTimer);
     clearInterval(muteTimer);
     clearTimeout(silenceTimer);
@@ -469,6 +533,7 @@ async function main() {
   });
 
   process.on("SIGTERM", async () => {
+    shuttingDown = true; // don't respawn snapclient for the kill() below
     clearInterval(pingTimer);
     clearInterval(muteTimer);
     clearTimeout(silenceTimer);

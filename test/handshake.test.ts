@@ -10,7 +10,15 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { MockWyomingServer } from "signalk-wyoming/mock";
 import { AudioStart, AudioChunk, parseAudioStart, parseAudioChunk } from "signalk-wyoming/protocol";
-import { handshake, bytesPerFrame, downmixToMono, FALLBACK_FORMAT } from "../bridge.mjs";
+import {
+  handshake,
+  bytesPerFrame,
+  downmixToMono,
+  FALLBACK_FORMAT,
+  nextRapidExitState,
+  RAPID_EXIT_THRESHOLD_MS,
+  MAX_CONSECUTIVE_RAPID_EXITS,
+} from "../bridge.mjs";
 
 let server: MockWyomingServer | undefined;
 
@@ -39,6 +47,40 @@ describe("downmixToMono", () => {
     expect(mono.length).toBe(4);
     expect(mono.readInt16LE(0)).toBe(150);
     expect(mono.readInt16LE(2)).toBe(-200);
+  });
+});
+
+describe("nextRapidExitState", () => {
+  it("increments the count when the run was shorter than the threshold", () => {
+    const { count, giveUp } = nextRapidExitState(100, 0);
+    expect(count).toBe(1);
+    expect(giveUp).toBe(false);
+  });
+
+  it("resets the count to 0 when the run lasted at least the threshold", () => {
+    const { count, giveUp } = nextRapidExitState(RAPID_EXIT_THRESHOLD_MS, 4);
+    expect(count).toBe(0);
+    expect(giveUp).toBe(false);
+  });
+
+  it("signals giveUp once the count reaches the max, not one before", () => {
+    const almost = nextRapidExitState(0, MAX_CONSECUTIVE_RAPID_EXITS - 2);
+    expect(almost.count).toBe(MAX_CONSECUTIVE_RAPID_EXITS - 1);
+    expect(almost.giveUp).toBe(false);
+
+    const atMax = nextRapidExitState(0, MAX_CONSECUTIVE_RAPID_EXITS - 1);
+    expect(atMax.count).toBe(MAX_CONSECUTIVE_RAPID_EXITS);
+    expect(atMax.giveUp).toBe(true);
+  });
+
+  it("a single long-lived run in between crashes clears the streak", () => {
+    let state = { count: 0 };
+    for (let i = 0; i < MAX_CONSECUTIVE_RAPID_EXITS - 1; i++) {
+      state = nextRapidExitState(0, state.count);
+    }
+    expect(state.giveUp).toBe(false);
+    state = nextRapidExitState(RAPID_EXIT_THRESHOLD_MS, state.count);
+    expect(state.count).toBe(0);
   });
 });
 
