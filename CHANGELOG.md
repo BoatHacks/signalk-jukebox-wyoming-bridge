@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-17
+
+### Fixed
+
+- Switching a zone onto a Snapcast stream with a different native
+  sample rate than whatever `snapclient` is currently decoding (e.g.
+  signalk-jukebox's AirPlay input, forced to 44100:16:2 while every
+  other stream there is 48000:16:2) reliably crashed `snapclient`
+  outright when it tried to reconfigure its resampler -- a normal,
+  expected consequence of a routine zone reassignment, not a real
+  failure. The old exit handler treated it exactly like a genuine
+  failure and killed the whole bridge process, relying on the
+  container's `restart:unless-stopped` policy to recover -- worse
+  given a separate, confirmed bug in `signalk-container-helper` where
+  that policy isn't actually applied to the container at all, this
+  meant a single zone-source switch could silently and permanently
+  kill the panel's audio. `snapclient` now respawns in place instead,
+  bounded so 5 rapid (<3s) crashes in a row still falls back to the
+  original fatal-exit behavior rather than respawning forever.
+  Confirmed live: repeatedly switching a zone between "jukebox" and
+  "airplay" reproduces the exact same crash, but the bridge now
+  recovers on its own within seconds instead of requiring a manual
+  container restart.
+
 ## [0.1.6] - 2026-09-16
 
 ### Fixed
