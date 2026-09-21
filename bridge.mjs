@@ -276,10 +276,15 @@ export class ControlConnection {
   }
 }
 
-/** Current muted state of one Snapcast client (our BRIDGE_ID). */
-async function getClientMuted(control, clientId) {
+/** Current muted state and Snapserver-side connected state of one Snapcast
+ *  client (our BRIDGE_ID) -- one Client.GetStatus call serves both pollers
+ *  below rather than duplicating the round trip. */
+async function getClientStatus(control, clientId) {
   const result = await control.call("Client.GetStatus", { id: clientId });
-  return Boolean(result?.client?.config?.volume?.muted);
+  return {
+    muted: Boolean(result?.client?.config?.volume?.muted),
+    connected: Boolean(result?.client?.connected),
+  };
 }
 
 // How many consecutive Client.GetStatus poll failures, after this bridge
@@ -318,6 +323,41 @@ export function nextControlFailureState(succeeded, previousStreak, everSucceeded
   const streak = previousStreak + 1;
   const forceReconnect = everSucceeded && streak >= CONTROL_FAILURE_RESPAWN_THRESHOLD;
   return { streak: forceReconnect ? 0 : streak, everSucceeded, forceReconnect };
+}
+
+// A distinct failure mode from the one above, found live on halpi2 right
+// after deploying the 0.1.8 fix for it: switching the zone off a
+// currently-flowing stream onto a silent one (`Alerts`, with nothing
+// announcing) sometimes left snapclient's own audio-data TCP connection to
+// Snapserver dead -- no exit (`podman top` showed the process still
+// running), no error logged, nothing -- while Snapserver's own
+// Client.GetStatus genuinely reports `connected: false` for it. Confirmed
+// this is a real gap in snapclient itself, not something masked by how
+// this bridge invokes it: `snapclient -h` (same 0.35.0 build this image
+// installs) exposes no keepalive/timeout/reconnect flag at all, so
+// snapclient has no way to notice a half-open connection on its own and no
+// option this bridge could just be passing. Snapserver's control API
+// already knows the truth, though, and this bridge already polls
+// Client.GetStatus every 2s for mute state -- reusing that same poll to
+// also check `connected` is the direct fix, mirroring
+// nextControlFailureState above: only counts after a prior successful
+// connect (so it can never fire on startup, before snapclient has
+// registered even once) and only forces a respawn after several
+// consecutive polls agree, so one poll racing a real, brief reconnect
+// doesn't cause a spurious kill.
+export const CLIENT_DISCONNECT_RESPAWN_THRESHOLD = 3;
+
+/** Given whether the latest Client.GetStatus poll reported our client as
+ *  connected, the current consecutive-disconnected streak, and whether it
+ *  was ever seen connected before, returns the updated streak/everConnected
+ *  and whether the caller should force snapclient to respawn. Pure, same
+ *  shape as nextControlFailureState, for the same reason (unit-testable
+ *  without a real Snapserver). */
+export function nextClientConnectionState(connected, previousStreak, everConnected) {
+  if (connected) return { streak: 0, everConnected: true, forceRespawn: false };
+  const streak = previousStreak + 1;
+  const forceRespawn = everConnected && streak >= CLIENT_DISCONNECT_RESPAWN_THRESHOLD;
+  return { streak: forceRespawn ? 0 : streak, everConnected, forceRespawn };
 }
 
 function requiredEnv(name) {
@@ -379,10 +419,12 @@ async function main() {
   let muted = false;
   let controlFailureStreak = 0;
   let everSucceeded = false;
+  let clientDisconnectStreak = 0;
+  let everConnected = false;
   const muteTimer = setInterval(async () => {
-    let nowMuted;
+    let status;
     try {
-      nowMuted = await getClientMuted(control, bridgeId);
+      status = await getClientStatus(control, bridgeId);
     } catch {
       const state = nextControlFailureState(false, controlFailureStreak, everSucceeded);
       controlFailureStreak = state.streak;
@@ -403,6 +445,27 @@ async function main() {
       controlFailureStreak,
       everSucceeded,
     ));
+
+    // Snapserver itself is reachable and answering (the try above
+    // succeeded), but says our own client id is disconnected -- snapclient
+    // has no keepalive/timeout of its own to notice this (confirmed against
+    // a real build: `snapclient -h` has no such flag), so ask the one party
+    // that actually knows. Respawning only snapclient here, not the whole
+    // control connection -- control.call() just worked, so there's nothing
+    // wrong with it.
+    const connState = nextClientConnectionState(status.connected, clientDisconnectStreak, everConnected);
+    clientDisconnectStreak = connState.streak;
+    everConnected = connState.everConnected;
+    if (connState.forceRespawn) {
+      console.error(
+        `Snapserver reports ${bridgeId} disconnected ${CLIENT_DISCONNECT_RESPAWN_THRESHOLD} ` +
+          "times in a row despite the local snapclient process still running; forcing it to respawn",
+      );
+      snapclient.kill();
+      return; // let the exit handler respawn; skip the mute check this tick
+    }
+
+    const nowMuted = status.muted;
     if (nowMuted === muted) return;
     muted = nowMuted;
     console.log(`zone ${muted ? "muted" : "unmuted"}`);
