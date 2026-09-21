@@ -203,7 +203,7 @@ function spawnSnapclient({ snapcastHost, snapcastPort, fifoPath, bridgeId, forma
  * call() reconnects -- no separate background retry loop needed at a
  * 2 s poll cadence.
  */
-class ControlConnection {
+export class ControlConnection {
   #host;
   #port;
   #socket = null;
@@ -282,6 +282,44 @@ async function getClientMuted(control, clientId) {
   return Boolean(result?.client?.config?.volume?.muted);
 }
 
+// How many consecutive Client.GetStatus poll failures, after this bridge
+// has already registered with Snapserver once, mean "the connection is
+// dead", not "a transient hiccup". Gated on everSucceeded (see
+// nextControlFailureState) because the FIRST few polls after startup are
+// *expected* to fail -- our own snapclient hasn't connected to Snapserver
+// yet -- and that must never itself count as a broken connection.
+//
+// Confirmed live on halpi2: `podman rm -f` on the sibling signalk-jukebox
+// container (recreating, not restarting, its Snapserver) leaves this
+// bridge's snapclient holding a stale TCP connection to the now-gone
+// server -- no exit, no error, no new log lines, forever. snapclient's
+// exit-triggered respawn (nextRapidExitState above) never fires because
+// snapclient itself never notices. Client.GetStatus polls over our own
+// ControlConnection DO notice, though, and promptly: either the poll
+// itself times out against the same kind of stale connection, or (once
+// ControlConnection's own reconnect dials the new container's control
+// port successfully) Snapserver replies with a "client not found" error
+// because our snapclient was never able to re-register. Either way, poll
+// failures after a prior success are the one reliable signal this bridge
+// has that Snapserver was swapped out from under it -- so this is the
+// hook used to force both connections to redial, the same net effect a
+// zone in signalk-jukebox proper gets for free by living in the same
+// container as its Snapserver (restarting together).
+export const CONTROL_FAILURE_RESPAWN_THRESHOLD = 3;
+
+/** Given whether the latest Client.GetStatus poll succeeded, the current
+ *  consecutive-failure streak, and whether any earlier poll ever
+ *  succeeded, returns the updated streak/everSucceeded and whether the
+ *  caller should force a reconnect. Pure so the threshold behaviour is
+ *  unit-testable without a real Snapserver -- mirrors nextRapidExitState
+ *  above. */
+export function nextControlFailureState(succeeded, previousStreak, everSucceeded) {
+  if (succeeded) return { streak: 0, everSucceeded: true, forceReconnect: false };
+  const streak = previousStreak + 1;
+  const forceReconnect = everSucceeded && streak >= CONTROL_FAILURE_RESPAWN_THRESHOLD;
+  return { streak: forceReconnect ? 0 : streak, everSucceeded, forceReconnect };
+}
+
 function requiredEnv(name) {
   const v = process.env[name];
   if (!v) {
@@ -339,13 +377,32 @@ async function main() {
   // error on every short-lived control connection closing).
   const control = new ControlConnection(snapcastHost, controlPort);
   let muted = false;
+  let controlFailureStreak = 0;
+  let everSucceeded = false;
   const muteTimer = setInterval(async () => {
     let nowMuted;
     try {
       nowMuted = await getClientMuted(control, bridgeId);
     } catch {
+      const state = nextControlFailureState(false, controlFailureStreak, everSucceeded);
+      controlFailureStreak = state.streak;
+      everSucceeded = state.everSucceeded;
+      if (state.forceReconnect) {
+        console.error(
+          `Client.GetStatus failed ${CONTROL_FAILURE_RESPAWN_THRESHOLD} times in a row after ` +
+            "previously succeeding; assuming Snapserver was replaced and snapclient's " +
+            "connection is now stale -- forcing both to reconnect",
+        );
+        control.close();
+        snapclient.kill();
+      }
       return; // client not registered yet, or a transient control-API hiccup
     }
+    ({ streak: controlFailureStreak, everSucceeded } = nextControlFailureState(
+      true,
+      controlFailureStreak,
+      everSucceeded,
+    ));
     if (nowMuted === muted) return;
     muted = nowMuted;
     console.log(`zone ${muted ? "muted" : "unmuted"}`);

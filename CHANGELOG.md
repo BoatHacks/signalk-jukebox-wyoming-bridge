@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-21
+
+### Fixed
+
+- Recreating (not restarting) the sibling `signalk-jukebox` plugin's
+  Snapserver container (`podman rm -f` + a fresh container, as opposed
+  to `podman restart`) left this bridge's `snapclient` holding a stale
+  TCP connection to the now-gone server forever -- no exit, no error,
+  no new log lines, the container itself reporting `Status: running`
+  the whole time, and the zone stuck at `connected: false` until
+  someone manually restarted the bridge's container. `snapclient`
+  itself never noticed the disconnect, so the existing exit-triggered
+  respawn logic (added in 0.1.7 for a different, unrelated crash) never
+  had anything to react to. The bridge's own `Client.GetStatus` polls
+  over its Snapserver control connection DO notice, though (either the
+  poll times out against the same kind of stale connection, or -- once
+  the control connection itself redials successfully -- Snapserver
+  replies "client not found" because `snapclient` never re-registered):
+  after any prior successful poll, `CONTROL_FAILURE_RESPAWN_THRESHOLD`
+  (3) consecutive poll failures now force both the control connection
+  and `snapclient` to redial from scratch, rather than sitting on the
+  stale connection indefinitely. Reproduced live on halpi2 (`podman rm
+  -f sk-jukebox` while the bridge was running); regression-tested here
+  with a mock control-API server that goes silent mid-connection
+  without closing it (`test/control-reconnect.test.ts`).
+
 ## [0.1.7] - 2026-09-17
 
 ### Fixed
