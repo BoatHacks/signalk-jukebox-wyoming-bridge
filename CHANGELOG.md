@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-22
+
+### Fixed
+
+- Found live on halpi2 immediately after deploying 0.1.8: switching the
+  Salon zone's Snapcast source from `MusicAndAlerts` to the silent
+  `Alerts` stream sometimes left the zone stuck at `connected: false`
+  -- confirmed directly against Snapserver's own `Server.GetStatus`
+  that it genuinely considered the `cockpit-panel` client disconnected.
+  Unlike the 0.1.8 bug, this was not the bridge's own control
+  connection going stale: `podman top` showed `snapclient`'s process
+  still alive, its logs ran cleanly right up to the disconnect and then
+  stopped, and `snapclient`'s own audio-data TCP connection to
+  Snapserver had gone stale/dead without the process exiting or
+  logging anything -- so neither the exit-triggered respawn (0.1.7)
+  nor the 0.1.8 control-connection watchdog (a separate TCP connection
+  with no visibility into `snapclient`'s own) had anything to react
+  to. Confirmed `snapclient` itself exposes no keepalive/timeout/
+  reconnect CLI flag (`snapclient -h`) that could have been passed
+  instead. Snapserver's control API already knows the truth, so the
+  existing `Client.GetStatus` poll (already used for zone-mute state)
+  now also checks the response's `connected` field and force-respawns
+  just `snapclient` (not the whole control connection) after
+  `CLIENT_DISCONNECT_RESPAWN_THRESHOLD` (3) consecutive polls report it
+  disconnected, gated on having seen it connected at least once so this
+  can never fire during normal startup. Regression-tested in
+  `test/client-disconnect-respawn.test.ts`.
+
 ## [0.1.8] - 2026-09-21
 
 ### Fixed

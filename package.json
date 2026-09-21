@@ -1,6 +1,6 @@
 {
   "name": "signalk-jukebox-wyoming-bridge",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "type": "module",
   "description": "Bridges a signalk-jukebox Snapcast zone to a Wyoming voice satellite's speaker (audio-start/audio-chunk/audio-stop framing).",
   "files": [
