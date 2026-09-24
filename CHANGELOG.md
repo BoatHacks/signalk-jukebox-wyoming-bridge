@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-09-24
+
+### Fixed
+
+- Found live on halpi2 running 0.1.9: the Salon zone went
+  stuck-disconnected again -- confirmed via Snapserver's own
+  `Server.GetStatus`, queried directly, that `cockpit-panel` really was
+  `connected: false` -- but this time `podman logs` showed *zero* new
+  lines for roughly 7 hours straight, not even the "Client.GetStatus
+  failed"/"disconnected N times" messages the 0.1.8/0.1.9 watchdogs
+  should have logged within a couple of poll cycles of the disconnect.
+  Instrumented and reproduced locally against both a fully black-holed
+  `connect()` and a connection that accepts writes but never replies
+  (the two closest real-world proxies for what actually happened): in
+  both cases `ControlConnection.call()`'s own timeout fires reliably in
+  ~3s regardless of socket state, confirming neither existing watchdog
+  can actually get stuck waiting on a `Client.GetStatus` response.
+  Whatever wedged the real poll loop for 7 hours therefore did so at a
+  level neither watchdog can see (most likely an event-loop stall from
+  some other cause -- e.g. a blocking `stdout` write against a stalled
+  log pipe, which `podman logs` alone can't rule out). This is the
+  fourth distinct connection-zombie incident here (0.1.7: `snapclient`
+  crash-exit, 0.1.8: this bridge's own control connection stale, 0.1.9:
+  `snapclient`'s data connection stale), and each of the first three
+  needed its own bespoke detector for its own specific connection, so
+  rather than add a fifth guess, this adds a detector that assumes
+  nothing about the cause: an independent watchdog that only checks
+  whether the poll loop itself is still ticking (via a heartbeat
+  recorded unconditionally as the very first thing the loop's callback
+  does, before any `await`), and force-exits the process if it stops --
+  the same "give up and let the container restart us" fallback
+  `nextRapidExitState` already relies on for `snapclient`'s own crash
+  loop. Regression-tested in `test/poll-stall-watchdog.test.ts`.
+
 ## [0.1.9] - 2026-09-22
 
 ### Fixed

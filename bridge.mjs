@@ -360,6 +360,44 @@ export function nextClientConnectionState(connected, previousStreak, everConnect
   return { streak: forceRespawn ? 0 : streak, everConnected, forceRespawn };
 }
 
+// A distinct failure mode from either of the two above, found live on
+// halpi2 running 0.1.9: the Salon zone went stuck-disconnected again --
+// confirmed via Snapserver's own Server.GetStatus, queried directly, that
+// `cockpit-panel` really was `connected: false` -- but this time `podman
+// logs` showed *zero* new lines for roughly 7 hours, not even the
+// "Client.GetStatus failed"/"disconnected N times" messages
+// nextControlFailureState/nextClientConnectionState above should have
+// produced within a couple of poll cycles of the disconnect. Instrumented
+// and reproduced locally against real black-holed and silently-swallowing
+// TCP peers (see test/control-reconnect.test.ts and
+// test/client-disconnect-respawn.test.ts) and confirmed ControlConnection's
+// own call() timeout fires reliably regardless of socket state -- a
+// fully black-holed connect() still rejects in ~3s, and a connection that
+// accepts writes but never replies still times out every poll, so neither
+// of the two watchdogs above can actually get stuck waiting on a
+// Client.GetStatus response. That means whatever wedged the poll loop for
+// 7 hours straight did so at a level neither watchdog can see or protect
+// against (an event-loop stall from any cause -- e.g. a blocking stdout
+// write against a stalled log pipe, which `podman logs` alone can't rule
+// out). Given this is the fourth distinct connection-zombie incident here
+// and each of the first three needed its own bespoke detector, this one
+// adds a detector that assumes nothing about the cause: an independent
+// watchdog that only checks whether the poll loop itself is still
+// ticking, and force-exits the process if it stops -- the same "give up
+// and let the container restart us" fallback nextRapidExitState already
+// relies on above.
+export const POLL_STALL_THRESHOLD_MS = 30_000; // 15x the poll cadence -- generous headroom over any legitimate single slow call
+
+/** Given the current time and when the poll loop's setInterval callback
+ *  last ran (recorded unconditionally as its very first statement, before
+ *  any await that could get stuck), returns whether the loop has gone
+ *  silent for longer than can be explained by a normal slow poll. Pure,
+ *  same shape as the other *State helpers above, for the same reason
+ *  (unit-testable without a real timer). */
+export function isPollStalled(now, lastTickAt, thresholdMs = POLL_STALL_THRESHOLD_MS) {
+  return now - lastTickAt > thresholdMs;
+}
+
 function requiredEnv(name) {
   const v = process.env[name];
   if (!v) {
@@ -421,7 +459,12 @@ async function main() {
   let everSucceeded = false;
   let clientDisconnectStreak = 0;
   let everConnected = false;
+  // Recorded as the very first thing the callback does, unconditionally --
+  // see isPollStalled's own doc comment above for why this exists and what
+  // it's independent of.
+  let lastPollTickAt = Date.now();
   const muteTimer = setInterval(async () => {
+    lastPollTickAt = Date.now();
     let status;
     try {
       status = await getClientStatus(control, bridgeId);
@@ -477,6 +520,20 @@ async function main() {
     // fresh audio-start the moment real chunks are allowed through again.
     if (muted) stopStream("zone muted");
   }, 2000);
+
+  // Independent of muteTimer's own body: runs on its own cadence and checks
+  // only whether that body is still ticking at all, not why it might not
+  // be -- see isPollStalled's doc comment above.
+  const watchdogTimer = setInterval(() => {
+    if (isPollStalled(Date.now(), lastPollTickAt)) {
+      console.error(
+        `poll loop hasn't ticked in over ${POLL_STALL_THRESHOLD_MS}ms; ` +
+          "assuming it's wedged in a way none of the connection-specific " +
+          "watchdogs above can catch -- exiting so the container restarts us",
+      );
+      process.exit(1);
+    }
+  }, 5000);
 
   await rm(fifoPath, { force: true });
   await mkdir("/tmp", { recursive: true });
@@ -557,6 +614,7 @@ async function main() {
     shuttingDown = true; // don't respawn snapclient for the kill() below
     clearInterval(pingTimer);
     clearInterval(muteTimer);
+    clearInterval(watchdogTimer);
     clearTimeout(silenceTimer);
     clearTimeout(noDataTimer);
     control.close();
@@ -656,6 +714,7 @@ async function main() {
     shuttingDown = true; // don't respawn snapclient for the kill() below
     clearInterval(pingTimer);
     clearInterval(muteTimer);
+    clearInterval(watchdogTimer);
     clearTimeout(silenceTimer);
     clearTimeout(noDataTimer);
     control.close();
